@@ -58,24 +58,25 @@ fn pick_format(args: &QueryArgs) -> Format {
 }
 
 pub fn run(args: QueryArgs) -> Result<()> {
+    let fmt = pick_format(&args);
+    let mode = if args.write {
+        OpenMode::ReadWrite
+    } else {
+        OpenMode::ReadOnly
+    };
+
     let mut sql_chunks: Vec<String> = Vec::new();
     if let Some(path) = &args.file {
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("read SQL file {}", path.display()))?;
         sql_chunks.push(body);
     }
-    sql_chunks.extend(args.execute.iter().cloned());
+    sql_chunks.extend(args.execute);
     if sql_chunks.is_empty() {
         bail!("no SQL provided — use -e \"...\" (repeatable) or -f <file>");
     }
 
-    let mode = if args.write {
-        OpenMode::ReadWrite
-    } else {
-        OpenMode::ReadOnly
-    };
     let opened = open_encrypted(&args.input, args.uid.as_deref(), mode)?;
-    let fmt = pick_format(&args);
 
     let stdout = io::stdout();
     let mut out = stdout.lock();

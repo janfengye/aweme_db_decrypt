@@ -8,7 +8,7 @@
 //! per statement to disable separation.
 
 use super::output::{render_csv_stream, render_json_stream, render_table, Format, ResultSet};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rusqlite::Connection;
 use std::io::Write;
 
@@ -20,7 +20,7 @@ pub fn execute_stmt(
     status_w: &mut impl Write,
     first_result: &mut bool,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(sql).map_err(|e| anyhow!(e))?;
+    let mut stmt = conn.prepare(sql)?;
     if stmt.column_count() == 0 {
         // No result set (DDL / INSERT / UPDATE / DELETE). Drop stmt first so
         // the borrow on conn is released, then read changes() afterward.

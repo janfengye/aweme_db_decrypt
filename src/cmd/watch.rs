@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 
@@ -296,7 +297,7 @@ fn fetch_recent(
     limit: usize,
 ) -> Result<Vec<Message>> {
     let sql = select_sql(args.conversation_id.is_some(), true, args.limit);
-    let mut stmt = resolver.core_conn.prepare(&sql)?;
+    let mut stmt = resolver.core_conn.prepare(sql)?;
     let mut rows = if let Some(conversation_id) = &args.conversation_id {
         stmt.query_map(params![conversation_id, limit as i64], row_to_message)?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -316,7 +317,7 @@ fn fetch_after(
     cursor: &Cursor,
 ) -> Result<Vec<Message>> {
     let sql = select_sql(args.conversation_id.is_some(), false, args.limit);
-    let mut stmt = resolver.core_conn.prepare(&sql)?;
+    let mut stmt = resolver.core_conn.prepare(sql)?;
     let mut rows = if let Some(conversation_id) = &args.conversation_id {
         if args.limit > 0 {
             stmt.query_map(
@@ -365,7 +366,33 @@ fn fetch_after(
     Ok(rows)
 }
 
-fn select_sql(has_conversation_filter: bool, recent: bool, limit: usize) -> String {
+fn variant_index(recent: bool, has_conversation_filter: bool, has_limit: bool) -> usize {
+    (usize::from(recent) << 2)
+        | (usize::from(has_conversation_filter) << 1)
+        | usize::from(has_limit)
+}
+
+/// Precomputed variants of the message-fetch SELECT. `watch` re-runs the query
+/// on every poll, so the six combinations are built once at first use instead
+/// of `format!`-ing a ~20-line string per iteration.
+static SELECT_SQL: LazyLock<[String; 8]> = LazyLock::new(|| {
+    let mut out = std::array::from_fn(|_| String::new());
+    for recent in [false, true] {
+        for has_conversation_filter in [false, true] {
+            for has_limit in [false, true] {
+                let idx = variant_index(recent, has_conversation_filter, has_limit);
+                out[idx] = build_select_sql(has_conversation_filter, recent, has_limit);
+            }
+        }
+    }
+    out
+});
+
+fn select_sql(has_conversation_filter: bool, recent: bool, limit: usize) -> &'static str {
+    &SELECT_SQL[variant_index(recent, has_conversation_filter, recent || limit > 0)]
+}
+
+fn build_select_sql(has_conversation_filter: bool, recent: bool, has_limit: bool) -> String {
     let where_clause = if recent {
         if has_conversation_filter {
             "WHERE m.conversation_id = ?"
@@ -378,7 +405,7 @@ fn select_sql(has_conversation_filter: bool, recent: bool, limit: usize) -> Stri
         "WHERE m.created_time > ? OR (m.created_time = ? AND m.msg_uuid > ?)"
     };
 
-    let limit_clause = if recent || limit > 0 { "LIMIT ?" } else { "" };
+    let limit_clause = if has_limit { "LIMIT ?" } else { "" };
     let inner_order = if recent { "DESC" } else { "ASC" };
 
     format!(

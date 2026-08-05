@@ -7,114 +7,89 @@
 pub fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_bracket = false;
-    let mut in_backtick = false;
+    let mut chars = sql.chars().peekable();
 
-    while i < sql.len() {
-        let c = sql[i..]
-            .chars()
-            .next()
-            .expect("i always points at a char boundary");
-        let next_byte = bytes.get(i + 1).copied();
-
-        if in_single {
+    while let Some(c) = chars.next() {
+        // Quoted string literal; doubled quotes are escaped inside it.
+        if c == '\'' || c == '"' {
             buf.push(c);
-            if c == '\'' {
-                if next_byte == Some(b'\'') {
-                    buf.push('\'');
-                    i += 2;
-                    continue;
+            let quote = c;
+            loop {
+                match chars.next() {
+                    Some(q) if q == quote && chars.peek() == Some(&quote) => {
+                        buf.push(q);
+                        buf.push(quote);
+                        chars.next();
+                    }
+                    Some(q) if q == quote => {
+                        buf.push(q);
+                        break;
+                    }
+                    Some(ch) => buf.push(ch),
+                    None => break,
                 }
-                in_single = false;
             }
-            i += c.len_utf8();
             continue;
         }
-        if in_double {
+        // [..] and `..` quoted identifiers.
+        if c == '[' {
             buf.push(c);
-            if c == '"' {
-                if next_byte == Some(b'"') {
-                    buf.push('"');
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += c.len_utf8();
-            continue;
-        }
-        if in_bracket {
-            buf.push(c);
-            if c == ']' {
-                in_bracket = false;
-            }
-            i += c.len_utf8();
-            continue;
-        }
-        if in_backtick {
-            buf.push(c);
-            if c == '`' {
-                in_backtick = false;
-            }
-            i += c.len_utf8();
-            continue;
-        }
-
-        if c == '-' && next_byte == Some(b'-') {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                let ch = sql[i..].chars().next().expect("char boundary");
+            for ch in chars.by_ref() {
                 buf.push(ch);
-                i += ch.len_utf8();
+                if ch == ']' {
+                    break;
+                }
             }
             continue;
         }
-        if c == '/' && next_byte == Some(b'*') {
+        if c == '`' {
+            buf.push(c);
+            for ch in chars.by_ref() {
+                buf.push(ch);
+                if ch == '`' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // -- line comment.
+        if c == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for ch in chars.by_ref() {
+                buf.push(ch);
+                if ch == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // /* block comment */.
+        if c == '/' && chars.peek() == Some(&'*') {
             buf.push_str("/*");
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                let ch = sql[i..].chars().next().expect("char boundary");
-                buf.push(ch);
-                i += ch.len_utf8();
-            }
-            if i + 1 < bytes.len() {
-                buf.push_str("*/");
-                i += 2;
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('*') if chars.peek() == Some(&'/') => {
+                        chars.next();
+                        buf.push_str("*/");
+                        break;
+                    }
+                    Some(ch) => buf.push(ch),
+                    None => break,
+                }
             }
             continue;
         }
-
-        match c {
-            '\'' => {
-                in_single = true;
-                buf.push(c);
+        if c == ';' {
+            buf.push(';');
+            let trimmed = buf.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
             }
-            '"' => {
-                in_double = true;
-                buf.push(c);
-            }
-            '[' => {
-                in_bracket = true;
-                buf.push(c);
-            }
-            '`' => {
-                in_backtick = true;
-                buf.push(c);
-            }
-            ';' => {
-                buf.push(';');
-                let trimmed = buf.trim();
-                if !trimmed.is_empty() {
-                    out.push(trimmed.to_string());
-                }
-                buf.clear();
-            }
-            _ => buf.push(c),
+            buf.clear();
+            continue;
         }
-        i += c.len_utf8();
+        buf.push(c);
     }
 
     let trimmed = buf.trim();

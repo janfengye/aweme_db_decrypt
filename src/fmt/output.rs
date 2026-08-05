@@ -56,10 +56,23 @@ fn display_width(s: &str) -> usize {
 
 // ---- table ----
 
+/// Number of characters `i.to_string()` would produce, without allocating.
+fn integer_digits(i: i64) -> usize {
+    let mut n = i.unsigned_abs();
+    let mut len = usize::from(i < 0);
+    loop {
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            return len;
+        }
+    }
+}
+
 fn cell_width(v: &Value) -> usize {
     match v {
         Value::Null => 4,
-        Value::Integer(i) => i.to_string().len(),
+        Value::Integer(i) => integer_digits(*i),
         Value::Real(f) => format!("{f}").len(),
         Value::Text(s) => s.width(),
         Value::Blob(b) => format!("<blob:{} bytes>", b.len()).len(),
@@ -74,19 +87,21 @@ fn write_cell(w: &mut impl Write, v: &Value, width: usize) -> io::Result<()> {
         }
         Value::Integer(i) => {
             write!(w, "{i}")?;
-            i.to_string().len()
+            integer_digits(*i)
         }
         Value::Real(f) => {
-            write!(w, "{f}")?;
-            format!("{f}").len()
+            let s = format!("{f}");
+            write!(w, "{s}")?;
+            s.len()
         }
         Value::Text(s) => {
             write!(w, "{s}")?;
             s.width()
         }
         Value::Blob(b) => {
-            write!(w, "<blob:{} bytes>", b.len())?;
-            format!("<blob:{} bytes>", b.len()).len()
+            let s = format!("<blob:{} bytes>", b.len());
+            write!(w, "{s}")?;
+            s.len()
         }
     };
     for _ in used..width {
