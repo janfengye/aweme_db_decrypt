@@ -2,10 +2,11 @@
 //! and print the result set(s) as a table (default), CSV, or JSON.
 
 use crate::db::open::{open_encrypted, OpenMode};
-use crate::fmt::output::{render, Format, ResultSet};
+use crate::fmt::exec::execute_stmt;
+use crate::fmt::output::Format;
 use crate::fmt::sql_split::split_statements;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -98,28 +99,7 @@ fn run_one(
     w: &mut impl Write,
     first_set: &mut bool,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(sql).map_err(|e| anyhow!(e))?;
-    if stmt.column_count() == 0 {
-        // No result set (DDL / INSERT / UPDATE / DELETE). Drop stmt first so
-        // the borrow on conn is released, then read changes() afterward.
-        let n = stmt.execute([])?;
-        drop(stmt);
-        // Print a small acknowledgment to stderr so it doesn't pollute piped
-        // table/csv/json output on stdout.
-        eprintln!("[+] ok ({n} row{} changed)", if n == 1 { "" } else { "s" });
-        return Ok(());
-    }
-
-    let rs = ResultSet::collect(&mut stmt)?;
-    drop(stmt);
-
-    // Separate multiple result sets. For JSON we emit one document per set,
-    // separated by blank lines (caller can split on `^\[$`); for table/csv
-    // a blank line is enough to keep them visually distinct.
-    if !*first_set {
-        writeln!(w)?;
-    }
-    *first_set = false;
-    render(&rs, fmt, w)?;
-    Ok(())
+    // Status lines go to stderr so they never pollute piped table/csv/json
+    // output on stdout.
+    execute_stmt(conn, sql, fmt, w, &mut io::stderr(), first_set)
 }

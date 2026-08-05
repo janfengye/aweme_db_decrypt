@@ -2,14 +2,15 @@
 //! scratch copy. Uses rustyline for history, line editing, and Ctrl-R search.
 
 use crate::db::open::{open_encrypted, OpenMode};
-use crate::fmt::output::{render, Format, ResultSet};
+use crate::fmt::exec::execute_stmt;
+use crate::fmt::output::Format;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Args;
 use rusqlite::Connection;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -133,20 +134,16 @@ fn run_read(conn: &Connection, path: &Path, fmt: Format) -> Result<()> {
 }
 
 fn exec_sql(conn: &Connection, sql: &str, fmt: Format) -> Result<()> {
-    let mut stmt = conn.prepare(sql).map_err(|e| anyhow!(e))?;
-    if stmt.column_count() == 0 {
-        let n = stmt.execute([])?;
-        drop(stmt);
-        println!("[+] ok ({n} row{} changed)", if n == 1 { "" } else { "s" });
-        return Ok(());
-    }
-    let rs = ResultSet::collect(&mut stmt)?;
-    drop(stmt);
-    let stdout = io::stdout();
-    let mut w = stdout.lock();
-    render(&rs, fmt, &mut w)?;
-    w.flush().ok();
-    Ok(())
+    // Two separate stdout handles (never borrowed at once) so status lines can
+    // share stdout with the result data without deadlocking on the lock.
+    execute_stmt(
+        conn,
+        sql,
+        fmt,
+        &mut io::stdout(),
+        &mut io::stdout(),
+        &mut true,
+    )
 }
 
 /// Returns true if the line should be treated as a meta-command (handled
