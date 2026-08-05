@@ -1,9 +1,8 @@
 //! `decrypt` subcommand: produce a plaintext SQLite copy of the encrypted DB.
 
-use crate::db::cipher::{
-    apply_v3_pragmas, passphrase_for_uid, resolve_kind_uid, verify_open,
-};
-use crate::db::workdir::{nice_path, with_suffix, WorkDir};
+use crate::db::cipher::{apply_v3_pragmas, passphrase_for_uid, verify_open};
+use crate::db::open::resolve_input;
+use crate::db::workdir::{with_suffix, WorkDir};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
@@ -50,8 +49,8 @@ fn default_output(input: &Path) -> PathBuf {
 }
 
 fn print_summary(conn: &Connection) -> Result<()> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
     let names: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
@@ -81,11 +80,9 @@ fn print_summary(conn: &Connection) -> Result<()> {
         for t in present {
             // Table names come from a hard-coded whitelist, so the format!() is
             // not a SQL-injection vector.
-            match conn.query_row::<i64, _, _>(
-                &format!("SELECT count(*) FROM \"{t}\""),
-                [],
-                |r| r.get(0),
-            ) {
+            match conn
+                .query_row::<i64, _, _>(&format!("SELECT count(*) FROM \"{t}\""), [], |r| r.get(0))
+            {
                 Ok(n) => println!("      {t:<24} {n}"),
                 Err(e) => eprintln!("      {t:<24} (query failed: {e})"),
             }
@@ -114,17 +111,7 @@ fn attach_and_export(conn: &Connection, target: &Path) -> Result<()> {
 }
 
 pub fn run(args: DecryptArgs) -> Result<()> {
-    let input = nice_path(
-        args.input
-            .canonicalize()
-            .with_context(|| format!("input file not found: {}", args.input.display()))?,
-    );
-    let filename = input
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("invalid filename"))?;
-
-    let (kind, uid) = resolve_kind_uid(filename, args.uid.as_deref())?;
+    let (input, kind, uid) = resolve_input(&args.input, args.uid.as_deref())?;
     let password = passphrase_for_uid(&uid);
 
     let output = args.output.unwrap_or_else(|| default_output(&input));
@@ -177,7 +164,10 @@ pub fn run(args: DecryptArgs) -> Result<()> {
 
     apply_v3_pragmas(&conn, &password)?;
     let object_count = verify_open(&conn)?;
-    println!("[+] decrypted: {} schema objects in sqlite_master", object_count);
+    println!(
+        "[+] decrypted: {} schema objects in sqlite_master",
+        object_count
+    );
 
     if let Ok(uv) = conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)) {
         if uv != 0 && uv != kind.schema_baseline() as i64 {

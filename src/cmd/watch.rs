@@ -5,7 +5,8 @@ use crate::db::open::open_encrypted_direct;
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use rusqlite::{params, Connection, Row};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -110,6 +111,83 @@ struct HttpEndpoint {
     host_header: String,
 }
 
+/// Cached nickname / peer-uid resolution shared across polling rounds. A
+/// long-running `watch` only re-queries the biz/core DBs when it meets a
+/// sender or conversation it has not seen before. Misses are deliberately not
+/// cached so a profile that appears mid-session is picked up on the next poll.
+struct NameResolver<'a> {
+    core_conn: &'a Connection,
+    biz_conn: Option<&'a Connection>,
+    self_uid: Option<i64>,
+    name_cache: HashMap<i64, String>,
+    peer_cache: HashMap<String, i64>,
+}
+
+impl<'a> NameResolver<'a> {
+    fn new(
+        core_conn: &'a Connection,
+        biz_conn: Option<&'a Connection>,
+        self_uid: Option<i64>,
+    ) -> Self {
+        NameResolver {
+            core_conn,
+            biz_conn,
+            self_uid,
+            name_cache: HashMap::new(),
+            peer_cache: HashMap::new(),
+        }
+    }
+
+    fn hydrate(&mut self, messages: &mut [Message]) {
+        for message in messages {
+            if let Some(sender) = message.sender {
+                if let Some(name) = self.name_for(sender) {
+                    message.sender_name = name;
+                }
+            }
+            if message.sender_name == message.sender.map(|v| v.to_string()).unwrap_or_default() {
+                if let Some(name) = extract_sender_name_from_content(&message.content) {
+                    message.sender_name = name;
+                }
+            }
+
+            if message.conversation_type == Some(1)
+                || message.conversation_name == message.conversation_id
+            {
+                if let Some(peer_uid) = self.peer_for(&message.conversation_id) {
+                    if let Some(peer_name) = self.name_for(peer_uid) {
+                        message.conversation_name = format!("私信:{peer_name}");
+                    } else {
+                        message.conversation_name = format!("私信:{peer_uid}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn name_for(&mut self, uid: i64) -> Option<String> {
+        if let Some(name) = self.name_cache.get(&uid) {
+            return Some(name.clone());
+        }
+        let name = lookup_user_name(self.biz_conn, uid);
+        if let Some(name) = &name {
+            self.name_cache.insert(uid, name.clone());
+        }
+        name
+    }
+
+    fn peer_for(&mut self, conversation_id: &str) -> Option<i64> {
+        if let Some(peer) = self.peer_cache.get(conversation_id) {
+            return Some(*peer);
+        }
+        let peer = peer_uid_for_conversation(self.core_conn, conversation_id, self.self_uid);
+        if let Some(peer) = peer {
+            self.peer_cache.insert(conversation_id.to_string(), peer);
+        }
+        peer
+    }
+}
+
 pub fn run(args: WatchArgs) -> Result<()> {
     let opened = open_encrypted_direct(&args.input, args.uid.as_deref())?;
     eprintln!(
@@ -136,15 +214,19 @@ pub fn run(args: WatchArgs) -> Result<()> {
         None
     };
     let fts_conn = fts.as_ref().map(|db| &db.conn);
+    let mut resolver = NameResolver::new(&opened.conn, biz_conn, self_uid);
 
     let mut cursor = if args.from_beginning {
-        Cursor { created_time: -1, msg_uuid: String::new() }
+        Cursor {
+            created_time: -1,
+            msg_uuid: String::new(),
+        }
     } else {
         tail_cursor(&opened.conn, args.conversation_id.as_deref())?
     };
 
     if args.recent > 0 {
-        let messages = fetch_recent(&opened.conn, biz_conn, fts_conn, self_uid, &args, args.recent)?;
+        let messages = fetch_recent(&mut resolver, fts_conn, &args, args.recent)?;
         for message in &messages {
             print_message(message, args.output)?;
         }
@@ -163,7 +245,7 @@ pub fn run(args: WatchArgs) -> Result<()> {
     }
 
     loop {
-        let messages = fetch_after(&opened.conn, biz_conn, fts_conn, self_uid, &args, &cursor)?;
+        let messages = fetch_after(&mut resolver, fts_conn, &args, &cursor)?;
         for message in &messages {
             print_message(message, args.output)?;
         }
@@ -201,19 +283,20 @@ fn tail_cursor(conn: &Connection, conversation_id: Option<&str>) -> Result<Curso
         )
         .optional()?
     };
-    Ok(row.unwrap_or(Cursor { created_time: -1, msg_uuid: String::new() }))
+    Ok(row.unwrap_or(Cursor {
+        created_time: -1,
+        msg_uuid: String::new(),
+    }))
 }
 
 fn fetch_recent(
-    conn: &Connection,
-    biz_conn: Option<&Connection>,
+    resolver: &mut NameResolver<'_>,
     fts_conn: Option<&Connection>,
-    self_uid: Option<i64>,
     args: &WatchArgs,
     limit: usize,
 ) -> Result<Vec<Message>> {
     let sql = select_sql(args.conversation_id.is_some(), true, args.limit);
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = resolver.core_conn.prepare(&sql)?;
     let mut rows = if let Some(conversation_id) = &args.conversation_id {
         stmt.query_map(params![conversation_id, limit as i64], row_to_message)?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -221,21 +304,19 @@ fn fetch_recent(
         stmt.query_map(params![limit as i64], row_to_message)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    hydrate_names(conn, biz_conn, self_uid, &mut rows);
+    resolver.hydrate(&mut rows);
     hydrate_search_content(fts_conn, &mut rows);
     Ok(rows)
 }
 
 fn fetch_after(
-    conn: &Connection,
-    biz_conn: Option<&Connection>,
+    resolver: &mut NameResolver<'_>,
     fts_conn: Option<&Connection>,
-    self_uid: Option<i64>,
     args: &WatchArgs,
     cursor: &Cursor,
 ) -> Result<Vec<Message>> {
     let sql = select_sql(args.conversation_id.is_some(), false, args.limit);
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = resolver.core_conn.prepare(&sql)?;
     let mut rows = if let Some(conversation_id) = &args.conversation_id {
         if args.limit > 0 {
             stmt.query_map(
@@ -263,7 +344,12 @@ fn fetch_after(
         }
     } else if args.limit > 0 {
         stmt.query_map(
-            params![cursor.created_time, cursor.created_time, cursor.msg_uuid, args.limit as i64],
+            params![
+                cursor.created_time,
+                cursor.created_time,
+                cursor.msg_uuid,
+                args.limit as i64
+            ],
             row_to_message,
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?
@@ -274,7 +360,7 @@ fn fetch_after(
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    hydrate_names(conn, biz_conn, self_uid, &mut rows);
+    resolver.hydrate(&mut rows);
     hydrate_search_content(fts_conn, &mut rows);
     Ok(rows)
 }
@@ -334,51 +420,52 @@ fn select_sql(has_conversation_filter: bool, recent: bool, limit: usize) -> Stri
     )
 }
 
-fn hydrate_names(
-    core_conn: &Connection,
-    biz_conn: Option<&Connection>,
-    self_uid: Option<i64>,
-    messages: &mut [Message],
-) {
+fn hydrate_search_content(fts_conn: Option<&Connection>, messages: &mut [Message]) {
+    let Some(conn) = fts_conn else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let found = lookup_search_contents(conn, messages);
     for message in messages {
-        if let Some(sender) = message.sender {
-            if let Some(name) = lookup_user_name(biz_conn, sender) {
-                message.sender_name = name;
-            }
-        }
-        if message.sender_name == message.sender.map(|v| v.to_string()).unwrap_or_default() {
-            if let Some(name) = extract_sender_name_from_content(&message.content) {
-                message.sender_name = name;
-            }
-        }
-
-        if message.conversation_type == Some(1) || message.conversation_name == message.conversation_id {
-            if let Some(peer_uid) = peer_uid_for_conversation(core_conn, &message.conversation_id, self_uid) {
-                if let Some(peer_name) = lookup_user_name(biz_conn, peer_uid) {
-                    message.conversation_name = format!("私信:{peer_name}");
-                } else {
-                    message.conversation_name = format!("私信:{peer_uid}");
-                }
+        if let Some(content) = found.get(message.msg_uuid.as_str()) {
+            if !content.trim().is_empty() {
+                message.search_content = Some(content.clone());
             }
         }
     }
 }
 
-fn hydrate_search_content(fts_conn: Option<&Connection>, messages: &mut [Message]) {
-    let Some(conn) = fts_conn else {
-        return;
-    };
-    for message in messages {
-        if let Ok(search_content) = conn.query_row(
-            "SELECT search_content FROM fts_search_msg_biz WHERE msg_uuid = ?",
-            [&message.msg_uuid],
-            |r| r.get::<_, String>(0),
-        ) {
-            if !search_content.trim().is_empty() {
-                message.search_content = Some(search_content);
+fn lookup_search_contents(conn: &Connection, messages: &[Message]) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    // SQLite allows at most SQLITE_MAX_VARIABLE_NUMBER bindings per statement;
+    // chunk conservatively so even a huge --recent batch works.
+    for chunk in messages.chunks(400) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT msg_uuid, search_content FROM fts_search_msg_biz \
+             WHERE msg_uuid IN ({placeholders})"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let params = rusqlite::params_from_iter(chunk.iter().map(|m| m.msg_uuid.as_str()));
+        let Ok(mut rows) = stmt.query(params) else {
+            continue;
+        };
+        while let Ok(Some(row)) = rows.next() {
+            match (row.get::<_, String>(0), row.get::<_, Option<String>>(1)) {
+                (Ok(uuid), Ok(Some(content))) if !content.trim().is_empty() => {
+                    found.insert(uuid, content);
+                }
+                _ => {}
             }
         }
     }
+    found
 }
 
 fn lookup_user_name(biz_conn: Option<&Connection>, uid: i64) -> Option<String> {
@@ -455,24 +542,27 @@ fn print_message(message: &Message, output: WatchOutput) -> Result<()> {
             );
         }
         WatchOutput::Jsonl => {
-            println!(
-                "{{\"time\":\"{}\",\"created_time\":{},\"conversation_id\":\"{}\",\"conversation_name\":\"{}\",\"conversation_type\":{},\"sender\":{},\"sender_name\":\"{}\",\"type_name\":\"{}\",\"msg_type\":{},\"msg_uuid\":\"{}\",\"msg_server_id\":{},\"text\":\"{}\"}}",
-                json_escape(&message.time_text),
-                message.created_time,
-                json_escape(&message.conversation_id),
-                json_escape(&message.conversation_name),
-                message.conversation_type.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-                message.sender.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-                json_escape(&message.sender_name),
-                json_escape(message_type_name(message.msg_type)),
-                message.msg_type.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-                json_escape(&message.msg_uuid),
-                message.msg_server_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-                json_escape(&message_display_text(message)),
-            );
+            println!("{}", serde_json::to_string(&watch_message_json(message))?);
         }
     }
     Ok(())
+}
+
+fn watch_message_json(message: &Message) -> Value {
+    json!({
+        "time": message.time_text,
+        "created_time": message.created_time,
+        "conversation_id": message.conversation_id,
+        "conversation_name": message.conversation_name,
+        "conversation_type": message.conversation_type,
+        "sender": message.sender,
+        "sender_name": message.sender_name,
+        "type_name": message_type_name(message.msg_type),
+        "msg_type": message.msg_type,
+        "msg_uuid": message.msg_uuid,
+        "msg_server_id": message.msg_server_id,
+        "text": message_display_text(message),
+    })
 }
 
 fn post_messages_if_needed(args: &WatchArgs, account_uid: &str, messages: &[Message]) {
@@ -488,9 +578,14 @@ fn post_messages_if_needed(args: &WatchArgs, account_uid: &str, messages: &[Mess
     }
 }
 
-fn post_messages(url: &str, account_uid: &str, messages: &[Message], timeout_ms: u64) -> Result<()> {
+fn post_messages(
+    url: &str,
+    account_uid: &str,
+    messages: &[Message],
+    timeout_ms: u64,
+) -> Result<()> {
     let endpoint = parse_http_url(url)?;
-    let body = build_post_body(account_uid, messages);
+    let body = serde_json::to_string(&post_body_json(account_uid, messages))?;
     let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
     let timeout = Duration::from_millis(timeout_ms);
     stream.set_read_timeout(Some(timeout)).ok();
@@ -499,7 +594,7 @@ fn post_messages(url: &str, account_uid: &str, messages: &[Message], timeout_ms:
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json; charset=utf-8\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
         endpoint.path,
         endpoint.host_header,
-        body.as_bytes().len(),
+        body.len(),
         body
     );
     stream.write_all(request.as_bytes())?;
@@ -532,40 +627,41 @@ fn parse_http_url(url: &str) -> Result<HttpEndpoint> {
         host: host.clone(),
         port,
         path,
-        host_header: if port == 80 { host } else { format!("{host}:{port}") },
+        host_header: if port == 80 {
+            host
+        } else {
+            format!("{host}:{port}")
+        },
     })
 }
 
-fn build_post_body(account_uid: &str, messages: &[Message]) -> String {
-    let mut out = String::from("{\"messages\":[");
-    for (idx, message) in messages.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        let direction = match message.sender.map(|v| v.to_string()) {
-            Some(sender) if sender == account_uid => "out",
-            _ if message.msg_type == Some(1) => "system",
-            _ => "in",
-        };
-        out.push_str(&format!(
-            "{{\"account_uid\":\"{}\",\"conversation_id\":\"{}\",\"conversation_type\":{},\"conversation_name\":\"{}\",\"msg_uuid\":\"{}\",\"msg_server_id\":{},\"created_time\":{},\"sender\":{},\"sender_name\":\"{}\",\"direction\":\"{}\",\"msg_type\":{},\"type_name\":\"{}\",\"text\":\"{}\"}}",
-            json_escape(account_uid),
-            json_escape(&message.conversation_id),
-            message.conversation_type.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-            json_escape(&message.conversation_name),
-            json_escape(&message.msg_uuid),
-            message.msg_server_id.map(|v| format!("\"{v}\"")).unwrap_or_else(|| "null".to_string()),
-            message.created_time,
-            message.sender.map(|v| format!("\"{v}\"")).unwrap_or_else(|| "null".to_string()),
-            json_escape(&message.sender_name),
-            direction,
-            message.msg_type.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-            json_escape(message_type_name(message.msg_type)),
-            json_escape(&message_display_text(message)),
-        ));
-    }
-    out.push_str("]}");
-    out
+fn post_body_json(account_uid: &str, messages: &[Message]) -> Value {
+    let items: Vec<Value> = messages
+        .iter()
+        .map(|message| {
+            let direction = match message.sender.map(|v| v.to_string()) {
+                Some(sender) if sender == account_uid => "out",
+                _ if message.msg_type == Some(1) => "system",
+                _ => "in",
+            };
+            json!({
+                "account_uid": account_uid,
+                "conversation_id": message.conversation_id,
+                "conversation_type": message.conversation_type,
+                "conversation_name": message.conversation_name,
+                "msg_uuid": message.msg_uuid,
+                "msg_server_id": message.msg_server_id.map(|v| v.to_string()),
+                "created_time": message.created_time,
+                "sender": message.sender.map(|v| v.to_string()),
+                "sender_name": message.sender_name,
+                "direction": direction,
+                "msg_type": message.msg_type,
+                "type_name": message_type_name(message.msg_type),
+                "text": message_display_text(message),
+            })
+        })
+        .collect();
+    json!({ "messages": items })
 }
 
 fn message_display_text(message: &Message) -> String {
@@ -761,22 +857,6 @@ fn first_string_for_keys(value: &Value, keys: &[&str]) -> Option<String> {
     }
 }
 
-fn json_escape(input: &str) -> String {
-    let mut out = String::new();
-    for ch in input.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 trait OptionalRow<T> {
     fn optional(self) -> rusqlite::Result<Option<T>>;
 }
@@ -788,5 +868,66 @@ impl<T> OptionalRow<T> for rusqlite::Result<T> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_message() -> Message {
+        Message {
+            msg_uuid: "uuid-1".to_string(),
+            msg_server_id: Some(42),
+            conversation_id: "c2c:u:1:2".to_string(),
+            conversation_name: "私信:2".to_string(),
+            conversation_type: Some(1),
+            created_time: 1_700_000_000_000,
+            time_text: "2023-11-15 00:00:00".to_string(),
+            sender: Some(7),
+            sender_name: "昵称".to_string(),
+            msg_type: Some(7),
+            content: r#"{"text":"你好，\"世界\""}"#.to_string(),
+            search_content: None,
+        }
+    }
+
+    #[test]
+    fn watch_jsonl_round_trips_fields_and_escapes() {
+        let value = watch_message_json(&sample_message());
+        let text = serde_json::to_string(&value).unwrap();
+        // Valid JSON that round-trips, with quotes inside the text escaped.
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["conversation_id"], "c2c:u:1:2");
+        assert_eq!(parsed["created_time"], 1_700_000_000_000i64);
+        assert_eq!(parsed["msg_server_id"], 42);
+        assert_eq!(parsed["sender"], 7);
+        assert_eq!(parsed["type_name"], "文本");
+        assert_eq!(parsed["text"], "你好，\"世界\"");
+        assert!(text.contains("\\\""));
+    }
+
+    #[test]
+    fn watch_jsonl_renders_missing_ids_as_null() {
+        let mut message = sample_message();
+        message.msg_server_id = None;
+        message.sender = None;
+        message.msg_type = None;
+        let value = watch_message_json(&message);
+        assert_eq!(value["msg_server_id"], Value::Null);
+        assert_eq!(value["sender"], Value::Null);
+        assert_eq!(value["msg_type"], Value::Null);
+        assert_eq!(value["type_name"], "未知类型");
+    }
+
+    #[test]
+    fn post_body_uses_string_ids_and_direction() {
+        let body = post_body_json("7", &[sample_message()]);
+        let item = &body["messages"][0];
+        assert_eq!(item["account_uid"], "7");
+        assert_eq!(item["msg_server_id"], "42");
+        assert_eq!(item["sender"], "7");
+        assert_eq!(item["direction"], "out");
+        assert_eq!(item["text"], "你好，\"世界\"");
     }
 }

@@ -30,6 +30,7 @@ triple_to_tag() {
         aarch64-linux-android)      echo "android-arm64" ;;
         armv7-linux-androideabi)    echo "android-armv7" ;;
         x86_64-linux-android)       echo "android-x86_64" ;;
+        i686-linux-android)         echo "android-x86" ;;
         *)                          echo "$1" ;;
     esac
 }

@@ -56,10 +56,18 @@ enum Command {
 fn rewrite_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
     // argv[0] is the binary name. Look at argv[1] to decide.
     let known: &[&str] = &[
-        "decrypt", "query", "shell", "watch", "help", "-h", "--help", "-V", "--version",
+        "decrypt",
+        "query",
+        "shell",
+        "watch",
+        "help",
+        "-h",
+        "--help",
+        "-V",
+        "--version",
     ];
     let needs_default = match argv.get(1).and_then(|s| s.to_str()) {
-        None => false,            // bare invocation; let clap show its error
+        None => false, // bare invocation; let clap show its error
         Some(s) => !known.contains(&s),
     };
     if needs_default {
@@ -83,5 +91,46 @@ fn main() {
     if let Err(e) = dispatch(cli) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn legacy_file_form_gets_decrypt_injected() {
+        let args = argv(&["aweme-db-decrypt", "encrypted_1_im.db", "--force"]);
+        let out = rewrite_argv(args);
+        assert_eq!(out[1].to_str(), Some("decrypt"));
+        assert_eq!(out[2].to_str(), Some("encrypted_1_im.db"));
+    }
+
+    #[test]
+    fn explicit_subcommands_and_help_are_not_rewritten() {
+        for cmd in [
+            "decrypt",
+            "query",
+            "shell",
+            "watch",
+            "help",
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+        ] {
+            let args = argv(&["aweme-db-decrypt", cmd]);
+            assert_eq!(rewrite_argv(args)[1].to_str(), Some(cmd));
+        }
+    }
+
+    #[test]
+    fn bare_invocation_stays_bare() {
+        let args = argv(&["aweme-db-decrypt"]);
+        assert_eq!(rewrite_argv(args).len(), 1);
     }
 }

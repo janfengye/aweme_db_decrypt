@@ -62,7 +62,11 @@ impl WorkDir {
         }
 
         let staged_plain = root.join("plain.staged.db");
-        Ok(WorkDir { root, db_copy, staged_plain })
+        Ok(WorkDir {
+            root,
+            db_copy,
+            staged_plain,
+        })
     }
 }
 

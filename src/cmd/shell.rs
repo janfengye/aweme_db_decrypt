@@ -123,8 +123,7 @@ fn show_schema(conn: &Connection, table: Option<&str>) -> Result<()> {
 }
 
 fn run_read(conn: &Connection, path: &Path, fmt: Format) -> Result<()> {
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     for stmt in crate::fmt::sql_split::split_statements(&body) {
         if let Err(e) = exec_sql(conn, &stmt, fmt) {
             eprintln!("error: {e:#}");
@@ -189,7 +188,11 @@ fn handle_meta(conn: &Connection, line: &str, fmt: &mut Format) -> Result<bool> 
 }
 
 pub fn run(args: ShellArgs) -> Result<()> {
-    let mode = if args.write { OpenMode::ReadWrite } else { OpenMode::ReadOnly };
+    let mode = if args.write {
+        OpenMode::ReadWrite
+    } else {
+        OpenMode::ReadOnly
+    };
     let opened = open_encrypted(&args.input, args.uid.as_deref(), mode)?;
     let mut fmt = parse_format(&args.mode).unwrap_or(Format::Table);
 
@@ -213,7 +216,11 @@ pub fn run(args: ShellArgs) -> Result<()> {
 
     let mut buf = String::new();
     loop {
-        let prompt = if buf.is_empty() { "sqlite> " } else { "   ...> " };
+        let prompt = if buf.is_empty() {
+            "sqlite> "
+        } else {
+            "   ...> "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 if buf.is_empty() && is_meta(&line) {

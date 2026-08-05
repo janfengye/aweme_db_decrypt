@@ -24,7 +24,12 @@ pub struct QueryArgs {
     pub execute: Vec<String>,
 
     /// Read SQL from a file. Mutually exclusive with -e.
-    #[arg(short = 'f', long = "file", value_name = "PATH", conflicts_with = "execute")]
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "PATH",
+        conflicts_with = "execute"
+    )]
     pub file: Option<PathBuf>,
 
     /// Emit JSON arrays instead of an aligned table.
@@ -63,7 +68,11 @@ pub fn run(args: QueryArgs) -> Result<()> {
         bail!("no SQL provided — use -e \"...\" (repeatable) or -f <file>");
     }
 
-    let mode = if args.write { OpenMode::ReadWrite } else { OpenMode::ReadOnly };
+    let mode = if args.write {
+        OpenMode::ReadWrite
+    } else {
+        OpenMode::ReadOnly
+    };
     let opened = open_encrypted(&args.input, args.uid.as_deref(), mode)?;
     let fmt = pick_format(&args);
 

@@ -1,6 +1,8 @@
 //! Split a SQL blob on top-level `;` boundaries while honoring `'…'` / `"…"`
 //! string literals, `[…]` and `` `…` `` quoted identifiers, and `--` / `/* */`
-//! comments. Returns each statement (trailing `;` preserved).
+//! comments. Returns each statement (trailing `;` preserved). The scanner works
+//! on `char` boundaries so multi-byte UTF-8 (Chinese text, emoji, …) in
+//! literals and comments is preserved verbatim.
 
 pub fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -12,33 +14,37 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     let mut in_bracket = false;
     let mut in_backtick = false;
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    while i < sql.len() {
+        let c = sql[i..]
+            .chars()
+            .next()
+            .expect("i always points at a char boundary");
+        let next_byte = bytes.get(i + 1).copied();
 
         if in_single {
             buf.push(c);
             if c == '\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] as char == '\'' {
+                if next_byte == Some(b'\'') {
                     buf.push('\'');
                     i += 2;
                     continue;
                 }
                 in_single = false;
             }
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
         if in_double {
             buf.push(c);
             if c == '"' {
-                if i + 1 < bytes.len() && bytes[i + 1] as char == '"' {
+                if next_byte == Some(b'"') {
                     buf.push('"');
                     i += 2;
                     continue;
                 }
                 in_double = false;
             }
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
         if in_bracket {
@@ -46,7 +52,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             if c == ']' {
                 in_bracket = false;
             }
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
         if in_backtick {
@@ -54,30 +60,28 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             if c == '`' {
                 in_backtick = false;
             }
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
 
-        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
-            while i < bytes.len() && bytes[i] as char != '\n' {
-                buf.push(bytes[i] as char);
-                i += 1;
+        if c == '-' && next_byte == Some(b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                let ch = sql[i..].chars().next().expect("char boundary");
+                buf.push(ch);
+                i += ch.len_utf8();
             }
             continue;
         }
-        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
-            buf.push('/');
-            buf.push('*');
+        if c == '/' && next_byte == Some(b'*') {
+            buf.push_str("/*");
             i += 2;
-            while i + 1 < bytes.len()
-                && !(bytes[i] as char == '*' && bytes[i + 1] as char == '/')
-            {
-                buf.push(bytes[i] as char);
-                i += 1;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                let ch = sql[i..].chars().next().expect("char boundary");
+                buf.push(ch);
+                i += ch.len_utf8();
             }
             if i + 1 < bytes.len() {
-                buf.push('*');
-                buf.push('/');
+                buf.push_str("*/");
                 i += 2;
             }
             continue;
@@ -110,7 +114,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             }
             _ => buf.push(c),
         }
-        i += 1;
+        i += c.len_utf8();
     }
 
     let trimmed = buf.trim();
@@ -154,5 +158,29 @@ mod tests {
     fn no_trailing_semicolon_still_emits() {
         let v = split_statements("SELECT 1");
         assert_eq!(v, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn preserves_utf8_in_string_literals() {
+        let v = split_statements("SELECT '你好;世界'; SELECT 2;");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], "SELECT '你好;世界';");
+        assert_eq!(v[1], "SELECT 2;");
+    }
+
+    #[test]
+    fn preserves_utf8_in_comments() {
+        let v = split_statements("-- 注释;里带分号\nSELECT '中文' /* 块注释; */; SELECT 2;");
+        assert_eq!(v.len(), 2);
+        assert!(v[0].contains("注释;里带分号"));
+        assert!(v[0].contains("SELECT '中文'"));
+        assert_eq!(v[1], "SELECT 2;");
+    }
+
+    #[test]
+    fn preserves_utf8_in_quoted_identifiers() {
+        let v = split_statements("SELECT `名字`, \"备注\" FROM t;");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "SELECT `名字`, \"备注\" FROM t;");
     }
 }

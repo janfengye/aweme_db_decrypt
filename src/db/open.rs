@@ -6,7 +6,7 @@ use super::workdir::{nice_path, WorkDir};
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{Connection, OpenFlags};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
@@ -34,11 +34,12 @@ pub struct DirectOpenedDb {
     pub uid: String,
 }
 
-pub fn open_encrypted(
+/// Canonicalize the input path and resolve (kind, uid) from filename plus any
+/// explicit `--uid` override. Shared by the copy-based and direct-open paths.
+pub fn resolve_input(
     input: &Path,
     uid_override: Option<&str>,
-    mode: OpenMode,
-) -> Result<OpenedDb> {
+) -> Result<(PathBuf, DbKind, String)> {
     let input = nice_path(
         input
             .canonicalize()
@@ -48,8 +49,16 @@ pub fn open_encrypted(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("invalid filename"))?;
-
     let (kind, uid) = resolve_kind_uid(filename, uid_override)?;
+    Ok((input, kind, uid))
+}
+
+pub fn open_encrypted(
+    input: &Path,
+    uid_override: Option<&str>,
+    mode: OpenMode,
+) -> Result<OpenedDb> {
+    let (input, kind, uid) = resolve_input(input, uid_override)?;
     let password = passphrase_for_uid(&uid);
 
     // For query/shell we never want to touch the source directory; put the
@@ -74,21 +83,16 @@ pub fn open_encrypted(
     apply_v3_pragmas(&conn, &password)?;
     verify_open(&conn)?;
 
-    Ok(OpenedDb { conn, kind, uid, _work: work })
+    Ok(OpenedDb {
+        conn,
+        kind,
+        uid,
+        _work: work,
+    })
 }
 
 pub fn open_encrypted_direct(input: &Path, uid_override: Option<&str>) -> Result<DirectOpenedDb> {
-    let input = nice_path(
-        input
-            .canonicalize()
-            .with_context(|| format!("input file not found: {}", input.display()))?,
-    );
-    let filename = input
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("invalid filename"))?;
-
-    let (kind, uid) = resolve_kind_uid(filename, uid_override)?;
+    let (input, kind, uid) = resolve_input(input, uid_override)?;
     let password = passphrase_for_uid(&uid);
 
     let conn = Connection::open_with_flags(

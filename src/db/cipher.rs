@@ -67,9 +67,7 @@ pub fn passphrase_for_uid(uid: &str) -> String {
     const PREFIX: &str = "byte";
     const MIDDLE: &str = "imwcdb";
     const SUFFIX: &str = "dance";
-    let mut s = String::with_capacity(
-        PREFIX.len() + MIDDLE.len() + SUFFIX.len() + uid.len() * 2,
-    );
+    let mut s = String::with_capacity(PREFIX.len() + MIDDLE.len() + SUFFIX.len() + uid.len() * 2);
     s.push_str(PREFIX);
     s.push_str(uid);
     s.push_str(MIDDLE);
@@ -111,11 +109,52 @@ pub fn resolve_kind_uid(filename: &str, override_uid: Option<&str>) -> Result<(D
                     Ok((k, u.to_string()))
                 }
                 Err(_) => {
-                    eprintln!("[i] note: filename does not match expected pattern; assuming IM Core");
+                    eprintln!(
+                        "[i] note: filename does not match expected pattern; assuming IM Core"
+                    );
                     Ok((DbKind::ImCore, u.to_string()))
                 }
             }
         }
         None => detect(filename),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_all_supported_filenames() {
+        assert_eq!(
+            detect("encrypted_123_im.db").unwrap(),
+            (DbKind::ImCore, "123".to_string())
+        );
+        assert_eq!(
+            detect("encrypted_sub_123_im.db").unwrap(),
+            (DbKind::ImCore, "123".to_string())
+        );
+        assert_eq!(
+            detect("encrypted_123_im_fts_split.db").unwrap(),
+            (DbKind::ImCore, "123".to_string())
+        );
+        assert_eq!(
+            detect("encrypted_im_biz_123.db").unwrap(),
+            (DbKind::ImBiz, "123".to_string())
+        );
+        assert!(detect("renamed.bin").is_err());
+        assert!(detect("encrypted_abc_im.db").is_err());
+    }
+
+    #[test]
+    fn passphrase_layout_is_stable() {
+        assert_eq!(passphrase_for_uid("123"), "byte123imwcdb123dance");
+    }
+
+    #[test]
+    fn validate_uid_rejects_non_digits() {
+        assert!(validate_uid("123").is_ok());
+        assert!(validate_uid("12a").is_err());
+        assert!(validate_uid("").is_err());
     }
 }

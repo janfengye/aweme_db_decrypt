@@ -4,6 +4,7 @@ use anyhow::Result;
 use rusqlite::types::Value;
 use rusqlite::Statement;
 use std::io::{self, Write};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -21,8 +22,11 @@ pub struct ResultSet {
 
 impl ResultSet {
     pub fn collect(stmt: &mut Statement<'_>) -> Result<ResultSet> {
-        let columns: Vec<String> =
-            stmt.column_names().into_iter().map(|s| s.to_string()).collect();
+        let columns: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         let n = columns.len();
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
@@ -57,12 +61,10 @@ fn cell_display(v: &Value) -> String {
 }
 
 fn display_width(s: &str) -> usize {
-    // Use char count rather than byte length so multi-byte UTF-8 (CJK)
-    // doesn't blow up the column width. This is still imperfect — wide
-    // glyphs (most CJK) actually take 2 terminal cells — but the simple
-    // count keeps borders aligned for ASCII-heavy data and stays close
-    // for everything else without pulling in a Unicode-width crate.
-    s.chars().count()
+    // unicode-width reports the terminal cells a string occupies: CJK wide
+    // glyphs count as 2, combining marks / control chars as 0, so table
+    // columns stay aligned even for Chinese-heavy IM data.
+    s.width()
 }
 
 fn render_table(rs: &ResultSet, w: &mut impl Write) -> io::Result<()> {
@@ -126,7 +128,12 @@ fn render_table(rs: &ResultSet, w: &mut impl Write) -> io::Result<()> {
         writeln!(w)?;
     }
 
-    writeln!(w, "({} row{})", rs.rows.len(), if rs.rows.len() == 1 { "" } else { "s" })?;
+    writeln!(
+        w,
+        "({} row{})",
+        rs.rows.len(),
+        if rs.rows.len() == 1 { "" } else { "s" }
+    )?;
     Ok(())
 }
 
@@ -252,3 +259,27 @@ fn hex_encode(b: &[u8]) -> String {
     s
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_width_counts_cjk_as_two_cells() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("你好"), 4);
+        assert_eq!(display_width("a你b"), 4);
+    }
+
+    #[test]
+    fn render_json_escapes_special_text() {
+        let rs = ResultSet {
+            columns: vec!["c".to_string()],
+            rows: vec![vec![Value::Text("a\n\"\\\u{1}b".to_string())]],
+        };
+        let mut out = Vec::new();
+        render(&rs, Format::Json, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed[0]["c"], "a\n\"\\\u{1}b");
+    }
+}
